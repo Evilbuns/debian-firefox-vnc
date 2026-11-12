@@ -17,6 +17,7 @@ RUN apt update && apt install -y --no-install-recommends \
     bash \
     wmctrl \
     openbox \
+    x11-utils \
     && apt clean
 
 # Created user for running Firefox and VNC
@@ -50,6 +51,16 @@ mkdir -p /home/firefox/.config/tigervnc
 chown -R firefox:firefox /home/firefox
 chown -R firefox:firefox /tmp/runtime-firefox
 
+# --- CLEANUP STALE LOCKS/SOCKETS FROM PREVIOUS RUN ---
+# /tmp persists across container restarts (as long as the container
+# itself isn't removed), so a leftover lock/socket from a previous
+# Xvnc process will make the new one refuse to start on the same
+# display, even though nothing is actually running anymore.
+DISPLAY_NUM="${DISPLAY#:}"
+pkill -u firefox Xvnc 2>/dev/null || true
+rm -f "/tmp/.X${DISPLAY_NUM}-lock"
+rm -f "/tmp/.X11-unix/X${DISPLAY_NUM}"
+
 # --- GENERATE VNC PASSWORD ---
 echo "$VNC_PASSWORD" | vncpasswd -f > "$VNC_PASSWORD_FILE"
 chmod 600 "$VNC_PASSWORD_FILE"
@@ -72,7 +83,7 @@ sleep 1
 
 # --- WAIT FOR X DISPLAY ---
 for i in $(seq 1 30); do
-    if xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
+    if sudo -u firefox xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
         break
     fi
     sleep 1
@@ -90,16 +101,22 @@ sleep 3
 
 # --- START FIREFOX ---
 echo "Starting Firefox"
-# Firefox sandboxing is usually blocked in containerized environments
-# (Docker Desktop / restricted namespaces), so disable it here.
-# This keeps the browser usable in a VNC/noVNC container setup.
-sudo -u firefox env \
-    DISPLAY=:1 \
-    HOME=/home/firefox \
-    XDG_RUNTIME_DIR=/tmp/runtime-firefox \
-    MOZ_DISABLE_CONTENT_SANDBOX=1 \
-    MOZ_DISABLE_RDD_SANDBOX=1 \
-    firefox --no-sandbox --disable-dev-shm-usage &
+# Firefox's sandbox needs unprivileged user namespaces, which some
+# container runtimes (e.g. rootless Docker) block with EPERM. Default
+# to enabled since it works on the target host (Unraid), but allow
+# falling back via DISABLE_FIREFOX_SANDBOX=true on hosts that don't
+# support it (e.g. rootless Docker in WSL).
+export DISABLE_FIREFOX_SANDBOX="${DISABLE_FIREFOX_SANDBOX:-false}"
+
+FIREFOX_ENV=(DISPLAY=:1 HOME=/home/firefox XDG_RUNTIME_DIR=/tmp/runtime-firefox)
+FIREFOX_ARGS=(--disable-dev-shm-usage)
+
+if [ "$DISABLE_FIREFOX_SANDBOX" = "true" ]; then
+    FIREFOX_ENV+=(MOZ_DISABLE_CONTENT_SANDBOX=1 MOZ_DISABLE_RDD_SANDBOX=1)
+    FIREFOX_ARGS+=(--no-sandbox)
+fi
+
+sudo -u firefox env "${FIREFOX_ENV[@]}" firefox "${FIREFOX_ARGS[@]}" &
 
 sleep 8
 wmctrl -r "Firefox" -b add,maximized_vert,maximized_horz || true
@@ -109,6 +126,27 @@ tail -f /dev/null
 EOF
 
 RUN chmod +x /start.sh
+
+# --- HEALTHCHECK SCRIPT ---
+# Verifies that Xvnc is alive, the X display actually accepts
+# connections, and the noVNC web server on 8080 is responding.
+# Unraid's autoheal (and the "Autoheal" feature in 7.4.0) reads this
+# status and restarts the container automatically if it goes unhealthy.
+RUN cat << 'EOF' > /healthcheck.sh
+#!/bin/bash
+set -e
+
+pgrep -u firefox Xvnc >/dev/null
+sudo -u firefox xdpyinfo -display :1 >/dev/null 2>&1
+curl -sf http://localhost:8080/ >/dev/null
+EOF
+
+RUN chmod +x /healthcheck.sh
+
+LABEL autoheal=true
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD /healthcheck.sh || exit 1
 
 EXPOSE 8080 5901
 
